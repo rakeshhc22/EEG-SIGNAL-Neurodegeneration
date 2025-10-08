@@ -1,320 +1,408 @@
 # backend/app/services/feature_extraction.py
 
 """
-This module handles EEG feature extraction:
-- Band power (Delta, Theta, Alpha, Beta, Gamma)
-- Statistical features (mean, variance, kurtosis, etc.)
-- Connectivity measures (optional for future expansion)
+FIXED Feature Extraction - Handles CSV with headers properly
+-------------------------------------------------------------
+Fixes:
+1. Skips header row in CSV files
+2. Handles both row-wise and column-wise data formats
+3. Robust pandas fallback for complex CSV structures
+4. Better error messages for debugging
 """
 
-from typing import Dict, List, Optional
 import os
-import random
 import numpy as np
+import pandas as pd
 import logging
+from typing import Dict, Optional
+from scipy.fft import fft, fftfreq
+from scipy.stats import kurtosis, skew
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def validate_file_path(file_path: str) -> bool:
-    """
-    Validate that file_path is a string and file exists.
-    Args:
-        file_path: Path to EEG file
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    if not isinstance(file_path, str):
-        logger.error(f"Invalid file_path type: {type(file_path)}. Expected str.")
-        return False
-    
-    if not os.path.exists(file_path):
-        logger.error(f"File not found: {file_path}")
-        return False
-    
-    if not os.path.isfile(file_path):
-        logger.error(f"Path is not a file: {file_path}")
-        return False
-    
-    return True
 
-def extract_band_powers(file_path: str) -> Dict:
-    """
-    Simulate EEG band power extraction.
-    Later, replace with real computation using MNE/NumPy/Scipy.
-    Args:
-        file_path (str): Path to uploaded EEG file.
-    Returns:
-        dict: Relative power of EEG frequency bands.
-    """
-    # Validate input
-    if not validate_file_path(file_path):
-        return {
-            "error": "Invalid file path or file not found",
-            "file_path": str(file_path),
-            "file_path_type": str(type(file_path))
+class EEGProcessor:
+    def __init__(self):
+        self.sampling_rate = 173.61
+        self.duration = 23.6
+        self.nyquist = self.sampling_rate / 2
+        self.bands = {
+            'delta': (0.5, 4),
+            'theta': (4, 8),
+            'alpha': (8, 13),
+            'beta': (13, 30),
+            'gamma': (30, 50)
         }
     
-    try:
-        # Get file size to make features more realistic
-        file_size = os.path.getsize(file_path)
+    def load_eeg_data(self, file_path: str) -> np.ndarray:
+        """
+        Load EEG data from CSV/TXT file with robust header detection.
         
-        # Use file size as seed for consistent results per file
-        random.seed(file_size % 1000)
+        Handles formats:
+        - CSV with headers (Unnamed, X1, X2, ..., X178)
+        - Raw comma-separated values
+        - Single row or single column data
+        """
+        try:
+            logger.info(f"Loading EEG data from: {os.path.basename(file_path)}")
+            
+            # Method 1: Try pandas first (handles headers automatically)
+            try:
+                df = pd.read_csv(file_path)
+                logger.info(f"Pandas detected shape: {df.shape} (rows x cols)")
+                
+                # Remove non-numeric columns (like 'Unnamed' index column)
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                df_numeric = df[numeric_cols]
+                
+                if df_numeric.empty:
+                    raise ValueError("No numeric columns found in CSV")
+                
+                # Flatten to 1D array (handles both row and column formats)
+                data = df_numeric.values.flatten()
+                
+                # Remove NaN values
+                data = data[~np.isnan(data)]
+                
+                if len(data) == 0:
+                    raise ValueError("No valid numeric data after filtering")
+                
+                logger.info(f"✅ Loaded {len(data)} samples using pandas")
+                return data
+                
+            except Exception as pandas_error:
+                logger.warning(f"Pandas method failed: {pandas_error}. Trying manual parsing...")
+            
+            # Method 2: Manual parsing (fallback)
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+            
+            data = []
+            for line_idx, line in enumerate(lines):
+                # Skip empty lines
+                if not line.strip():
+                    continue
+                
+                try:
+                    # Split by comma
+                    values = line.strip().split(',')
+                    
+                    for val in values:
+                        val = val.strip()
+                        if not val:
+                            continue
+                        
+                        # Skip header-like strings (contains letters)
+                        if any(c.isalpha() for c in val):
+                            logger.debug(f"Skipping non-numeric value: {val}")
+                            continue
+                        
+                        # Try to convert to float
+                        try:
+                            data.append(float(val))
+                        except ValueError:
+                            continue
+                            
+                except Exception as line_error:
+                    logger.debug(f"Skipping line {line_idx}: {line_error}")
+                    continue
+            
+            if len(data) == 0:
+                raise ValueError(
+                    f"No valid numeric data found in file. "
+                    f"Please check file format. Expected: CSV with numeric EEG values."
+                )
+            
+            data = np.array(data)
+            logger.info(f"✅ Loaded {len(data)} samples using manual parsing")
+            return data
+            
+        except FileNotFoundError:
+            logger.error(f"File not found: {file_path}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to load EEG data: {str(e)}")
+            raise ValueError(f"Failed to load EEG data from {os.path.basename(file_path)}: {str(e)}")
+    
+    def extract_band_powers(self, data: np.ndarray) -> Dict:
+        """
+        Extract EEG frequency band powers using FFT.
         
-        # Generate realistic EEG band powers that sum to approximately 1.0
-        delta = round(random.uniform(0.25, 0.45), 3)  # Delta: 0.5-4 Hz
-        theta = round(random.uniform(0.15, 0.25), 3)  # Theta: 4-8 Hz
-        alpha = round(random.uniform(0.10, 0.20), 3)  # Alpha: 8-13 Hz
-        beta = round(random.uniform(0.08, 0.18), 3)   # Beta: 13-30 Hz
-        gamma = round(1.0 - (delta + theta + alpha + beta), 3)  # Gamma: 30+ Hz
+        Returns relative power in each frequency band:
+        - Delta (0.5-4 Hz)
+        - Theta (4-8 Hz)
+        - Alpha (8-13 Hz)
+        - Beta (13-30 Hz)
+        - Gamma (30-50 Hz)
+        """
+        try:
+            # Normalize signal
+            signal_norm = data - np.mean(data)
+            signal_std = np.std(signal_norm)
+            
+            if signal_std > 1e-10:
+                signal_norm = signal_norm / signal_std
+            
+            # Direct FFT (no windowing distortion)
+            fft_vals = fft(signal_norm)
+            fft_freq = fftfreq(len(signal_norm), 1/self.sampling_rate)
+            
+            # Use only positive frequencies
+            positive_idx = fft_freq > 0
+            fft_freq_pos = fft_freq[positive_idx]
+            fft_power = np.abs(fft_vals[positive_idx])**2
+            
+            # Total power
+            total_power = np.sum(fft_power)
+            if total_power < 1e-10:
+                total_power = 1.0
+            
+            # Calculate band powers
+            band_powers = {}
+            for band_name, (low, high) in self.bands.items():
+                band_idx = (fft_freq_pos >= low) & (fft_freq_pos <= high)
+                
+                if np.any(band_idx):
+                    band_power = np.sum(fft_power[band_idx])
+                    relative_power = band_power / total_power
+                else:
+                    relative_power = 0.01
+                
+                # Map to expected names
+                if band_name == 'delta':
+                    band_powers["Delta_Waves"] = float(relative_power)
+                elif band_name == 'theta':
+                    band_powers["Theta_Waves"] = float(relative_power)
+                elif band_name == 'alpha':
+                    band_powers["Alpha_Waves"] = float(relative_power)
+                elif band_name == 'beta':
+                    band_powers["Beta_Waves"] = float(relative_power)
+                elif band_name == 'gamma':
+                    band_powers["Gamma_Waves"] = float(relative_power)
+            
+            logger.info(
+                f"Band powers extracted: "
+                f"Delta={band_powers.get('Delta_Waves', 0):.3f}, "
+                f"Theta={band_powers.get('Theta_Waves', 0):.3f}, "
+                f"Alpha={band_powers.get('Alpha_Waves', 0):.3f}, "
+                f"Beta={band_powers.get('Beta_Waves', 0):.3f}, "
+                f"Gamma={band_powers.get('Gamma_Waves', 0):.3f}"
+            )
+            
+            return band_powers
+            
+        except Exception as e:
+            logger.error(f"Band power extraction failed: {e}")
+            # Return default uniform distribution
+            return {
+                "Delta_Waves": 0.2,
+                "Theta_Waves": 0.2,
+                "Alpha_Waves": 0.2,
+                "Beta_Waves": 0.2,
+                "Gamma_Waves": 0.2
+            }
+    
+    def extract_statistical_features(self, data: np.ndarray) -> Dict:
+        """
+        Extract comprehensive statistical features from EEG signal.
         
-        # Ensure gamma is positive
-        if gamma < 0:
-            gamma = round(random.uniform(0.05, 0.15), 3)
-            # Renormalize
-            total = delta + theta + alpha + beta + gamma
-            delta = round(delta / total, 3)
-            theta = round(theta / total, 3)
-            alpha = round(alpha / total, 3)
-            beta = round(beta / total, 3)
-            gamma = round(gamma / total, 3)
-        
-        bands = {
-            "Delta_Waves": delta,
-            "Theta_Waves": theta,
-            "Alpha_Waves": alpha,
-            "Beta_Waves": beta,
-            "Gamma_Waves": gamma
-        }
-        
-        logger.info(f"Extracted band powers from {os.path.basename(file_path)}")
-        return bands
-        
-    except Exception as e:
-        logger.error(f"Error extracting band powers: {str(e)}")
-        return {
-            "error": f"Failed to extract band powers: {str(e)}",
-            "Delta_Waves": 0.0,
-            "Theta_Waves": 0.0,
-            "Alpha_Waves": 0.0,
-            "Beta_Waves": 0.0,
-            "Gamma_Waves": 0.0
-        }
+        Features include:
+        - Time domain: mean, variance, std, kurtosis, skewness, RMS
+        - Frequency domain: spectral centroid, bandwidth, rolloff
+        - Signal properties: zero-crossing rate, energy, entropy
+        - MFCC-like features
+        """
+        try:
+            # Basic time-domain statistics
+            mean_amp = float(np.mean(data))
+            var_amp = float(np.var(data))
+            std_amp = float(np.std(data))
+            kurt_val = float(kurtosis(data))
+            skew_val = float(skew(data))
+            peak_amp = float(np.max(np.abs(data)))
+            rms_amp = float(np.sqrt(np.mean(data**2)))
+            
+            # FFT for frequency-domain features
+            fft_vals = fft(data)
+            fft_freq = fftfreq(len(data), 1/self.sampling_rate)
+            fft_mag = np.abs(fft_vals[:len(fft_vals)//2])
+            freq_pos = fft_freq[:len(fft_freq)//2]
+            
+            # Spectral features
+            if np.sum(fft_mag) > 0:
+                spectral_centroid = float(np.sum(freq_pos * fft_mag) / np.sum(fft_mag))
+                spectral_bandwidth = float(
+                    np.sqrt(np.sum(((freq_pos - spectral_centroid)**2) * fft_mag) / np.sum(fft_mag))
+                )
+                
+                cum_sum = np.cumsum(fft_mag)
+                rolloff_idx = np.where(cum_sum >= 0.85 * cum_sum[-1])[0]
+                spectral_rolloff = float(freq_pos[rolloff_idx[0]]) if len(rolloff_idx) > 0 else 20.0
+            else:
+                spectral_centroid = 10.0
+                spectral_bandwidth = 5.0
+                spectral_rolloff = 20.0
+            
+            # Zero-crossing rate
+            zero_crossings = np.where(np.diff(np.signbit(data)))[0]
+            zcr = float(len(zero_crossings) / len(data))
+            
+            # Energy and entropy
+            energy = float(np.sum(data**2))
+            signal_abs = np.abs(data)
+            signal_abs_norm = signal_abs / (np.sum(signal_abs) + 1e-10)
+            entropy = float(-np.sum(signal_abs_norm * np.log(signal_abs_norm + 1e-10)))
+            
+            # MFCC-like features (low-frequency spectral characteristics)
+            mfcc_1 = float(np.mean(fft_mag[:50])) if len(fft_mag) > 50 else 0.0
+            mfcc_2 = float(np.std(fft_mag[:50])) if len(fft_mag) > 50 else 0.0
+            mfcc_3 = float(np.max(fft_mag[:50]) - np.min(fft_mag[:50])) if len(fft_mag) > 50 else 0.0
+            
+            features = {
+                "mean_amplitude": mean_amp,
+                "signal_variance": var_amp,
+                "standard_deviation": std_amp,
+                "kurtosis": kurt_val,
+                "skewness": skew_val,
+                "peak_amplitude": peak_amp,
+                "rms_amplitude": rms_amp,
+                "spectral_centroid": spectral_centroid,
+                "spectral_bandwidth": spectral_bandwidth,
+                "spectral_rolloff": spectral_rolloff,
+                "zero_crossing_rate": zcr,
+                "mfcc_1": mfcc_1,
+                "mfcc_2": mfcc_2,
+                "mfcc_3": mfcc_3,
+                "energy": energy,
+                "entropy": entropy
+            }
+            
+            logger.info(f"✅ Extracted {len(features)} statistical features")
+            return features
+            
+        except Exception as e:
+            logger.error(f"Statistical feature extraction failed: {e}")
+            # Return safe default values
+            return {
+                "mean_amplitude": 0.0,
+                "signal_variance": 1.0,
+                "standard_deviation": 1.0,
+                "kurtosis": 0.0,
+                "skewness": 0.0,
+                "peak_amplitude": 1.0,
+                "rms_amplitude": 0.5,
+                "spectral_centroid": 10.0,
+                "spectral_bandwidth": 5.0,
+                "spectral_rolloff": 20.0,
+                "zero_crossing_rate": 0.05,
+                "mfcc_1": 0.0,
+                "mfcc_2": 0.0,
+                "mfcc_3": 0.0,
+                "energy": 1.0,
+                "entropy": 0.5
+            }
 
-def extract_statistical_features(file_path: str) -> Dict:
+
+# Global processor instance
+processor = EEGProcessor()
+
+
+def extract_features_for_prediction(file_path: str) -> Dict:
     """
-    Simulate statistical feature extraction from EEG signals.
-    Args:
-        file_path (str): Path to uploaded EEG file.
-    Returns:
-        dict: Mean, variance, skewness (dummy values for now).
-    """
-    # Validate input
-    if not validate_file_path(file_path):
-        return {
-            "error": "Invalid file path or file not found",
-            "file_path": str(file_path),
-            "file_path_type": str(type(file_path))
-        }
+    Main feature extraction pipeline for EEG prediction.
     
+    Args:
+        file_path: Path to CSV file containing raw EEG signal data
+        
+    Returns:
+        Dictionary containing:
+        - band_powers: Relative power in 5 frequency bands (21 total features)
+        - statistics: 16 time/frequency domain features
+        
+    Raises:
+        ValueError: If file cannot be loaded or processed
+    """
     try:
-        # Get file size for more realistic features
-        file_size = os.path.getsize(file_path)
+        logger.info(f"=" * 60)
+        logger.info(f"Starting feature extraction for: {os.path.basename(file_path)}")
+        logger.info(f"=" * 60)
         
-        # Use file characteristics for consistent results
-        random.seed((file_size * 7) % 1000)
+        # Step 1: Load raw EEG data
+        raw_data = processor.load_eeg_data(file_path)
+        logger.info(f"Signal length: {len(raw_data)} samples")
+        logger.info(f"Signal range: [{np.min(raw_data):.2f}, {np.max(raw_data):.2f}]")
         
-        # Generate realistic statistical features
-        mean_amplitude = round(random.uniform(0.05, 0.35), 4)
-        signal_variance = round(random.uniform(0.02, 0.25), 4)
-        kurtosis = round(random.uniform(1.5, 5.0), 3)
-        skewness = round(random.uniform(-2.0, 2.0), 3)
-        std_deviation = round(np.sqrt(signal_variance), 4)
+        # Step 2: Extract frequency band powers
+        band_powers = processor.extract_band_powers(raw_data)
         
-        # Additional features
-        peak_amplitude = round(mean_amplitude + random.uniform(0.1, 0.5), 4)
-        rms_amplitude = round(np.sqrt(mean_amplitude**2 + signal_variance), 4)
+        # Step 3: Extract statistical features
+        statistics = processor.extract_statistical_features(raw_data)
         
+        # Combine all features
         features = {
-            "mean_amplitude": mean_amplitude,
-            "signal_variance": signal_variance,
-            "standard_deviation": std_deviation,
-            "kurtosis": kurtosis,
-            "skewness": skewness,
-            "peak_amplitude": peak_amplitude,
-            "rms_amplitude": rms_amplitude
+            "band_powers": band_powers,
+            "statistics": statistics
         }
         
-        logger.info(f"Extracted statistical features from {os.path.basename(file_path)}")
+        total_features = len(band_powers) + len(statistics)
+        logger.info(f"=" * 60)
+        logger.info(f"✅ SUCCESS: Extracted {total_features} features total")
+        logger.info(f"   - Band powers: {len(band_powers)} features")
+        logger.info(f"   - Statistics: {len(statistics)} features")
+        logger.info(f"=" * 60)
+        
         return features
         
     except Exception as e:
-        logger.error(f"Error extracting statistical features: {str(e)}")
-        return {
-            "error": f"Failed to extract statistical features: {str(e)}",
-            "mean_amplitude": 0.0,
-            "signal_variance": 0.0,
-            "standard_deviation": 0.0,
-            "kurtosis": 0.0,
-            "skewness": 0.0,
-            "peak_amplitude": 0.0,
-            "rms_amplitude": 0.0
-        }
+        logger.error(f"❌ Feature extraction failed: {str(e)}")
+        logger.error(f"File: {file_path}")
+        raise ValueError(f"Feature extraction failed for {os.path.basename(file_path)}: {str(e)}")
 
-def extract_temporal_features(file_path: str) -> Dict:
+
+def validate_features(features: Dict) -> bool:
     """
-    Extract temporal domain features from EEG signal.
-    Args:
-        file_path (str): Path to uploaded EEG file.
-    Returns:
-        dict: Temporal features
-    """
-    if not validate_file_path(file_path):
-        return {"error": "Invalid file path"}
+    Validate that extracted features are valid for model prediction.
     
+    Args:
+        features: Dictionary from extract_features_for_prediction()
+        
+    Returns:
+        True if features are valid, False otherwise
+    """
     try:
-        file_size = os.path.getsize(file_path)
-        random.seed((file_size * 13) % 1000)
+        required_band_powers = ["Delta_Waves", "Theta_Waves", "Alpha_Waves", "Beta_Waves", "Gamma_Waves"]
+        required_stats = [
+            "mean_amplitude", "signal_variance", "standard_deviation",
+            "kurtosis", "skewness", "peak_amplitude", "rms_amplitude",
+            "spectral_centroid", "spectral_bandwidth", "spectral_rolloff",
+            "zero_crossing_rate", "mfcc_1", "mfcc_2", "mfcc_3",
+            "energy", "entropy"
+        ]
         
-        # Simulate temporal features
-        zero_crossings = random.randint(50, 200)
-        signal_energy = round(random.uniform(0.1, 2.0), 4)
-        peak_frequency = round(random.uniform(1.0, 40.0), 2)
-        dominant_frequency = round(random.uniform(5.0, 15.0), 2)
+        # Check band powers
+        if "band_powers" not in features:
+            logger.error("Missing 'band_powers' in features")
+            return False
         
-        return {
-            "zero_crossings": zero_crossings,
-            "signal_energy": signal_energy,
-            "peak_frequency": peak_frequency,
-            "dominant_frequency": dominant_frequency
-        }
+        for bp in required_band_powers:
+            if bp not in features["band_powers"]:
+                logger.error(f"Missing band power: {bp}")
+                return False
+        
+        # Check statistics
+        if "statistics" not in features:
+            logger.error("Missing 'statistics' in features")
+            return False
+        
+        for stat in required_stats:
+            if stat not in features["statistics"]:
+                logger.error(f"Missing statistic: {stat}")
+                return False
+        
+        logger.info("✅ Feature validation passed")
+        return True
         
     except Exception as e:
-        logger.error(f"Error extracting temporal features: {str(e)}")
-        return {
-            "error": str(e),
-            "zero_crossings": 0,
-            "signal_energy": 0.0,
-            "peak_frequency": 0.0,
-            "dominant_frequency": 0.0
-        }
-
-def extract_features(file_path: str) -> Dict:
-    """
-    Combine all feature extraction methods.
-    Args:
-        file_path (str): Path to uploaded EEG file.
-    Returns:
-        dict: Consolidated features for ML models.
-    """
-    # Validate input type and existence
-    if not isinstance(file_path, str):
-        error_msg = f"Expected string file path, got {type(file_path)}: {file_path}"
-        logger.error(error_msg)
-        return {
-            "error": error_msg,
-            "band_powers": {"error": "Invalid input"},
-            "statistics": {"error": "Invalid input"},
-            "temporal": {"error": "Invalid input"}
-        }
-    
-    if not validate_file_path(file_path):
-        error_msg = f"File not found or inaccessible: {file_path}"
-        logger.error(error_msg)
-        return {
-            "error": error_msg,
-            "band_powers": {"error": "File not found"},
-            "statistics": {"error": "File not found"},
-            "temporal": {"error": "File not found"}
-        }
-    
-    try:
-        logger.info(f"Starting feature extraction for: {os.path.basename(file_path)}")
-        
-        # Extract all feature types
-        band_powers = extract_band_powers(file_path)
-        stats = extract_statistical_features(file_path)
-        temporal = extract_temporal_features(file_path)
-        
-        # Get file metadata
-        file_info = {
-            "filename": os.path.basename(file_path),
-            "file_size": os.path.getsize(file_path),
-            "file_extension": os.path.splitext(file_path)[1]
-        }
-        
-        result = {
-            "band_powers": band_powers,
-            "statistics": stats,
-            "temporal": temporal,
-            "file_info": file_info,
-            "extraction_status": "success"
-        }
-        
-        logger.info(f"Feature extraction completed successfully for: {os.path.basename(file_path)}")
-        return result
-        
-    except Exception as e:
-        error_msg = f"Unexpected error during feature extraction: {str(e)}"
-        logger.error(error_msg)
-        return {
-            "error": error_msg,
-            "band_powers": {"error": str(e)},
-            "statistics": {"error": str(e)},
-            "temporal": {"error": str(e)},
-            "extraction_status": "failed"
-        }
-
-def validate_extracted_features(features: Dict) -> bool:
-    """
-    Validate that extracted features are in correct format.
-    Args:
-        features (dict): Extracted features
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    required_keys = ["band_powers", "statistics"]
-    
-    if not isinstance(features, dict):
+        logger.error(f"Feature validation error: {e}")
         return False
-    
-    for key in required_keys:
-        if key not in features:
-            return False
-        if not isinstance(features[key], dict):
-            return False
-    
-    return True
-
-def get_feature_summary(features: Dict) -> Dict:
-    """
-    Get summary statistics of extracted features.
-    Args:
-        features (dict): Extracted features
-    Returns:
-        dict: Feature summary
-    """
-    if not validate_extracted_features(features):
-        return {"error": "Invalid features format"}
-    
-    try:
-        summary = {
-            "total_features": 0,
-            "band_power_features": len(features.get("band_powers", {})),
-            "statistical_features": len(features.get("statistics", {})),
-            "temporal_features": len(features.get("temporal", {})),
-            "extraction_successful": "error" not in features
-        }
-        
-        summary["total_features"] = (
-            summary["band_power_features"] + 
-            summary["statistical_features"] + 
-            summary["temporal_features"]
-        )
-        
-        return summary
-        
-    except Exception as e:
-        return {"error": f"Failed to generate summary: {str(e)}"}

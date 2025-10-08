@@ -1,7 +1,7 @@
 # backend/app/main.py
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from app.db import Base, engine
 from app.routes import (
     analysis_routes,
@@ -21,7 +21,7 @@ app = FastAPI(title="NeuroDetect API", version="1.0.0")
 # ✅ CORS setup (allow React frontend to connect)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # in production restrict to your frontend URL
+    allow_origins=["*"],  # in production restrict to your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

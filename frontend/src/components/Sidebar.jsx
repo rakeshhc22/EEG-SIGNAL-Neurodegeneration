@@ -25,7 +25,7 @@ export default function Sidebar() {
     { name: "Signal Analysis", icon: FaChartLine, route: "/analysis" },
     { name: "Results", icon: FaClipboardList, route: "/results" },
     { name: "Patients", icon: FaUserInjured, route: "/patients" },
-    { name: "Reports", icon: FaFileAlt, route: "/reports" },
+    
   ];
 
   const handleMenuClick = (item) => {

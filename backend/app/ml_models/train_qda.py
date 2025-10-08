@@ -1,222 +1,278 @@
-# backend/app/ml_models/train_qda.py
-
 """
-QDA Model Training Script
--------------------------
-- Loads EEG dataset with features and labels
-- Trains QuadraticDiscriminantAnalysis model
-- Saves trained model to pickle file
-- Handles proper data preparation and validation
+QDA Model Training Script for 3-Class EEG Dataset
+Optimized for 178-feature format with Normal, Seizure, and Neurodegeneration classes
 """
 
-import os
-import pickle
-import logging
 import numpy as np
+import pandas as pd
+import pickle
+import os
 from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
-from sklearn.datasets import make_classification
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from imblearn.over_sampling import SMOTE
+import warnings
+warnings.filterwarnings('ignore')
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+class DataLoader:
+    """Data loader for 178-feature EEG CSV format"""
+    
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
+    
+    def load_eeg_data(self, filepath):
+        """Load 3-class EEG dataset directly"""
+        print(f"Loading EEG dataset from {filepath}...")
+        df = pd.read_csv(filepath)
+        
+        print(f"Raw dataset shape: {df.shape}")
+        print(f"Columns: {df.columns.tolist()[:5]}... (showing first 5)")
+        
+        # Check if there's an unnamed index column
+        if 'Unnamed: 0' in df.columns:
+            print("Removing 'Unnamed: 0' index column...")
+            df = df.drop(columns=['Unnamed: 0'])
+        
+        # Separate features and labels
+        # Last column should be 'y' (label)
+        if 'y' in df.columns:
+            X = df.drop(columns=['y']).values
+            y = df['y'].values
+            feature_names = df.drop(columns=['y']).columns.tolist()
+        else:
+            # Assume last column is label
+            X = df.iloc[:, :-1].values
+            y = df.iloc[:, -1].values
+            feature_names = df.columns[:-1].tolist()
+        
+        # Convert to numeric, forcing any non-numeric to NaN
+        print("\nConverting data to numeric format...")
+        X = pd.DataFrame(X).apply(pd.to_numeric, errors='coerce').values
+        y = pd.Series(y).apply(pd.to_numeric, errors='coerce').values
+        
+        # Handle any NaN values created during conversion
+        if np.any(np.isnan(X)):
+            print(f"Warning: Found {np.sum(np.isnan(X))} NaN values after conversion, filling with 0")
+            X = np.nan_to_num(X, nan=0.0)
+        
+        if np.any(np.isnan(y)):
+            print(f"Warning: Found {np.sum(np.isnan(y))} NaN labels, this is a data quality issue!")
+            y = np.nan_to_num(y, nan=0)
+        
+        print(f"\nFinal dataset shape: {X.shape}")
+        print(f"Number of features: {X.shape[1]}")
+        print(f"Classes: {np.unique(y)}")
+        print(f"\nClass distribution:")
+        for class_id, count in pd.Series(y).value_counts().sort_index().items():
+            class_name = {0: 'Normal', 1: 'Seizure', 2: 'Neurodegeneration'}.get(int(class_id), 'Unknown')
+            print(f"  Class {int(class_id)} ({class_name}): {count} samples")
+        
+        return X, y.astype(int), feature_names
 
-def generate_dummy_eeg_dataset(n_samples=1000):
-    """
-    Generate dummy EEG-like dataset for training.
-    Replace this with your actual EEG data loading function.
-    """
-    logger.info(f"Generating dummy EEG dataset with {n_samples} samples...")
+class QDATrainer:
+    """QDA trainer for 3-class EEG classification"""
     
-    # Generate synthetic classification data
-    X_raw, y = make_classification(
-        n_samples=n_samples,
-        n_features=12,  # 5 band powers + 7 statistical features
-        n_classes=2,
-        n_redundant=2,
-        n_informative=8,
-        random_state=42,
-        class_sep=0.8
-    )
-    
-    # Convert to EEG-like feature format
-    dataset = []
-    for i in range(n_samples):
-        # Split features into band powers and statistics
-        features = {
-            "band_powers": {
-                "Delta_Waves": float(abs(X_raw[i][0])),
-                "Theta_Waves": float(abs(X_raw[i][1])),
-                "Alpha_Waves": float(abs(X_raw[i][2])),
-                "Beta_Waves": float(abs(X_raw[i][3])),
-                "Gamma_Waves": float(abs(X_raw[i][4]))
-            },
-            "statistics": {
-                "mean_amplitude": float(X_raw[i][5]),
-                "signal_variance": float(abs(X_raw[i][6])),
-                "standard_deviation": float(abs(X_raw[i][7])),
-                "kurtosis": float(X_raw[i][8]),
-                "skewness": float(X_raw[i][9]),
-                "peak_amplitude": float(abs(X_raw[i][10])),
-                "rms_amplitude": float(abs(X_raw[i][11]))
-            }
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
+        self.feature_names = None
+        self.class_mapping = {
+            0: 'Normal',
+            1: 'Seizure',
+            2: 'Neurodegeneration'
         }
+    
+    def prepare_data(self, X, y):
+        """Prepare data with proper scaling and encoding"""
+        print("\nPreparing data for training...")
         
-        sample = {
-            "features": features,
-            "label": int(y[i])  # 0 = Normal, 1 = Seizure
-        }
-        dataset.append(sample)
-    
-    # Verify class distribution
-    class_counts = {}
-    for sample in dataset:
-        label = sample["label"]
-        class_counts[label] = class_counts.get(label, 0) + 1
-    
-    logger.info(f"Dataset class distribution: {class_counts}")
-    return dataset
-
-def prepare_data_for_qda(dataset):
-    """
-    Convert dataset into feature matrix (X) and labels (y) for QDA training.
-    """
-    logger.info("Preparing data for QDA training...")
-    
-    X = []
-    y = []
-    
-    for sample in dataset:
-        try:
-            feats = []
-            
-            # Flatten band powers
-            if "band_powers" in sample["features"]:
-                for val in sample["features"]["band_powers"].values():
-                    feats.append(float(val))
-            
-            # Flatten statistics
-            if "statistics" in sample["features"]:
-                for val in sample["features"]["statistics"].values():
-                    feats.append(float(val))
-            
-            if len(feats) > 0:
-                X.append(feats)
-                y.append(int(sample["label"]))
-                
-        except Exception as e:
-            logger.warning(f"Skipping invalid sample: {e}")
-            continue
-    
-    X = np.array(X)
-    y = np.array(y)
-    
-    logger.info(f"Prepared {len(X)} samples with {X.shape[1]} features")
-    logger.info(f"Feature matrix shape: {X.shape}")
-    logger.info(f"Label distribution: {np.bincount(y)}")
-    
-    return X, y
-
-def train_and_save_qda():
-    """
-    Train QDA model and save to disk.
-    """
-    try:
-        logger.info("🚀 Starting QDA model training...")
+        # Ensure X is float array
+        X = X.astype(np.float64)
         
-        # Load dataset (replace with your actual data loading)
-        dataset = generate_dummy_eeg_dataset(n_samples=2000)
+        # Encode labels
+        y_encoded = self.label_encoder.fit_transform(y)
         
-        # Prepare data
-        X, y = prepare_data_for_qda(dataset)
+        # Final check for invalid values
+        if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+            print("Warning: Found NaN or Inf values in final check, cleaning...")
+            X = np.nan_to_num(X, nan=0.0, posinf=1e10, neginf=-1e10)
         
-        # Check if we have enough samples and classes
-        unique_classes = np.unique(y)
-        if len(unique_classes) < 2:
-            raise ValueError(f"Need at least 2 classes for training, got {len(unique_classes)}")
+        print(f"Prepared dataset shape: {X.shape}")
+        print(f"Label encoding: {dict(zip(self.label_encoder.classes_, range(len(self.label_encoder.classes_))))}")
         
-        if len(X) < 10:
-            raise ValueError(f"Need at least 10 samples for training, got {len(X)}")
+        return X, y_encoded
+    
+    def train(self, X, y):
+        """Train QDA model with cross-validation"""
+        print("\n" + "="*60)
+        print("Training QDA Model for 3-Class EEG Classification")
+        print("="*60)
         
-        # Split data
+        # Split data (80% train, 20% test)
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
         
-        logger.info(f"Training set: {len(X_train)} samples")
-        logger.info(f"Test set: {len(X_test)} samples")
+        print(f"\nTrain set: {X_train.shape}")
+        print(f"Test set: {X_test.shape}")
         
-        # Train QDA model
-        logger.info("Training QuadraticDiscriminantAnalysis model...")
-        model = QuadraticDiscriminantAnalysis()
-        model.fit(X_train, y_train)
+        # Scale features
+        print("\nScaling features...")
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
         
-        # Evaluate model
-        y_pred = model.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        cm = confusion_matrix(y_test, y_pred)
+        # Apply SMOTE for class balancing
+        print("\nChecking class balance...")
+        train_class_counts = pd.Series(y_train).value_counts()
+        print(f"Training set class distribution:\n{train_class_counts}")
         
-        logger.info(f"✅ QDA training completed!")
-        logger.info(f"📊 Test Accuracy: {accuracy * 100:.2f}%")
-        logger.info(f"📊 Confusion Matrix:\n{cm}")
-        
-        # Print detailed classification report
-        report = classification_report(y_test, y_pred, target_names=['Normal', 'Seizure'])
-        logger.info(f"📊 Classification Report:\n{report}")
-        
-        # Save model to disk
-        model_dir = "app/ml_models"
-        os.makedirs(model_dir, exist_ok=True)
-        model_path = os.path.join(model_dir, "qda_model.pkl")
-        
-        logger.info(f"💾 Saving QDA model to {model_path}...")
-        
-        with open(model_path, 'wb') as f:
-            pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        # Verify save
-        if os.path.exists(model_path):
-            file_size = os.path.getsize(model_path)
-            logger.info(f"✅ QDA model saved successfully ({file_size} bytes)")
+        # Only apply SMOTE if classes are imbalanced
+        if train_class_counts.min() < train_class_counts.max() * 0.8:
+            print("\nApplying SMOTE for class balance...")
+            try:
+                smote = SMOTE(random_state=42, k_neighbors=3)
+                X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
+                print(f"After SMOTE: {X_train_balanced.shape}")
+                print(f"Balanced class distribution:\n{pd.Series(y_train_balanced).value_counts()}")
+            except Exception as e:
+                print(f"SMOTE not applied: {e}")
+                X_train_balanced, y_train_balanced = X_train_scaled, y_train
         else:
-            raise Exception("Failed to save model file")
-            
-        # Test loading the saved model
-        logger.info("🔍 Testing model loading...")
-        with open(model_path, 'rb') as f:
-            loaded_model = pickle.load(f)
+            print("Classes are already balanced, skipping SMOTE")
+            X_train_balanced, y_train_balanced = X_train_scaled, y_train
         
-        # Quick prediction test
-        test_pred = loaded_model.predict(X_test[:5])
-        logger.info(f"✅ Model loading test successful. Sample predictions: {test_pred}")
+        # Grid search for best regularization parameter
+        print("\n" + "-"*60)
+        print("Performing hyperparameter tuning...")
+        param_grid = {'reg_param': [0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5]}
         
-        return {
-            "model_path": model_path,
-            "accuracy": accuracy * 100,
-            "confusion_matrix": cm.tolist(),
-            "train_samples": len(X_train),
-            "test_samples": len(X_test),
-            "feature_count": X.shape[1]
+        qda = QuadraticDiscriminantAnalysis()
+        grid_search = GridSearchCV(
+            qda, param_grid, cv=5, scoring='accuracy', n_jobs=-1, verbose=0
+        )
+        grid_search.fit(X_train_balanced, y_train_balanced)
+        
+        print(f"Best regularization parameter: {grid_search.best_params_['reg_param']}")
+        print(f"Best CV accuracy: {grid_search.best_score_:.4f}")
+        
+        # Train final model with best parameters
+        self.model = grid_search.best_estimator_
+        
+        # Evaluate on training data
+        train_pred = self.model.predict(X_train_balanced)
+        train_acc = accuracy_score(y_train_balanced, train_pred)
+        
+        # Evaluate on test data
+        test_pred = self.model.predict(X_test_scaled)
+        test_acc = accuracy_score(y_test, test_pred)
+        
+        print(f"\n" + "-"*60)
+        print(f"Training Accuracy: {train_acc:.4f} ({train_acc*100:.2f}%)")
+        print(f"Test Accuracy: {test_acc:.4f} ({test_acc*100:.2f}%)")
+        
+        # Detailed classification report
+        print("\n" + "="*60)
+        print("Classification Report (Test Set)")
+        print("="*60)
+        target_names = [self.class_mapping[i] for i in sorted(self.class_mapping.keys())]
+        print(classification_report(y_test, test_pred, target_names=target_names, digits=4))
+        
+        # Confusion matrix
+        print("\nConfusion Matrix:")
+        cm = confusion_matrix(y_test, test_pred)
+        print(cm)
+        print("\nConfusion Matrix Format:")
+        print("           Predicted")
+        print("           Normal  Seizure  Neurodegeneration")
+        print(f"Normal       {cm[0,0]:>4}    {cm[0,1]:>4}       {cm[0,2]:>4}")
+        print(f"Seizure      {cm[1,0]:>4}    {cm[1,1]:>4}       {cm[1,2]:>4}")
+        print(f"Neurodegenr. {cm[2,0]:>4}    {cm[2,1]:>4}       {cm[2,2]:>4}")
+        
+        return self.model, test_acc
+    
+    def save_model(self, filepath):
+        """Save trained model with all components"""
+        if self.model is None:
+            print("Error: No model to save")
+            return
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        # Get actual feature count
+        n_features = len(self.feature_names) if self.feature_names else 178
+        
+        # Package model with metadata
+        model_package = {
+            'model': self.model,
+            'scaler': self.scaler,
+            'label_encoder': self.label_encoder,
+            'feature_names': self.feature_names,
+            'class_mapping': self.class_mapping,
+            'n_features': n_features,
+            'model_type': 'QDA',
+            'classes': list(self.class_mapping.values())
         }
         
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_package, f)
+        
+        print(f"\n✅ Model saved successfully to: {filepath}")
+        print(f"   Model type: QDA")
+        print(f"   Features: {n_features}")
+        print(f"   Classes: {list(self.class_mapping.values())}")
+
+def main():
+    """Main training function"""
+    print("\n" + "="*60)
+    print("🚀 QDA Model Training for 3-Class EEG Classification")
+    print("   Normal | Seizure | Neurodegeneration")
+    print("="*60)
+    
+    # Initialize components
+    loader = DataLoader()
+    trainer = QDATrainer()
+    
+    # File path - matches your folder structure
+    data_file = "Data/Normal/3class_eeg_balanced_178features.csv"
+    
+    try:
+        # Check if file exists
+        if not os.path.exists(data_file):
+            raise FileNotFoundError(
+                f"Dataset not found at: {data_file}\n"
+                f"Please ensure '3class_eeg_balanced_178features.csv' is in Data/Normal/ folder"
+            )
+        
+        # Load data
+        X, y, feature_names = loader.load_eeg_data(data_file)
+        trainer.feature_names = feature_names
+        
+        # Prepare data
+        X_prepared, y_prepared = trainer.prepare_data(X, y)
+        
+        # Train model
+        model, accuracy = trainer.train(X_prepared, y_prepared)
+        
+        # Save model - matches your existing path structure
+        model_path = 'ml_models/trained_models/qda_model.pkl'
+        trainer.save_model(model_path)
+        
+        print("\n" + "="*60)
+        print("✅ QDA Training Complete!")
+        print(f"   Final Test Accuracy: {accuracy:.2%}")
+        print(f"   Model saved at: {model_path}")
+        print("="*60)
+        
+    except FileNotFoundError as e:
+        print(f"\n❌ File Error: {e}")
     except Exception as e:
-        logger.error(f"❌ QDA training failed: {str(e)}")
-        raise
+        print(f"\n❌ Training failed with error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    try:
-        results = train_and_save_qda()
-        print("\n" + "="*50)
-        print("🎉 QDA TRAINING COMPLETED SUCCESSFULLY!")
-        print("="*50)
-        print(f"Model saved to: {results['model_path']}")
-        print(f"Accuracy: {results['accuracy']:.2f}%")
-        print(f"Training samples: {results['train_samples']}")
-        print(f"Test samples: {results['test_samples']}")
-        print(f"Feature count: {results['feature_count']}")
-        print("="*50)
-        
-    except Exception as e:
-        print(f"\n❌ Training failed: {e}")
-        exit(1)
+    main()

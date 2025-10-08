@@ -1,253 +1,342 @@
-# backend/app/ml_models/train_tabnet.py
+"""
+TabNet Model Training Script for 3-Class EEG Dataset
+Optimized for 178-feature format with Normal, Seizure, and Neurodegeneration classes
+"""
 
-"""
-TabNet Model Training Script
-----------------------------
-- Loads EEG dataset with features and labels
-- Trains TabNet classifier model
-- Saves trained model to zip file
-- Handles proper data preparation and validation
-"""
-import torch
-import os
-import logging
 import numpy as np
+import pandas as pd
+import pickle
+import os
+import torch
 from pytorch_tabnet.tab_model import TabNetClassifier
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
-from sklearn.datasets import make_classification
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+from imblearn.over_sampling import SMOTE
+import warnings
+warnings.filterwarnings('ignore')
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+class DataLoader:
+    """Data loader for EEG CSV format"""
+    
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
+    
+    def load_eeg_data(self, filepath):
+        """Load 3-class EEG dataset directly"""
+        print(f"Loading EEG dataset from {filepath}...")
+        df = pd.read_csv(filepath)
+        
+        print(f"Raw dataset shape: {df.shape}")
+        print(f"Columns: {df.columns.tolist()[:5]}... (showing first 5)")
+        
+        # Check if there's an unnamed index column
+        if 'Unnamed: 0' in df.columns:
+            print("Removing 'Unnamed: 0' index column...")
+            df = df.drop(columns=['Unnamed: 0'])
+        
+        # Separate features and labels
+        # Last column should be 'y' (label)
+        if 'y' in df.columns:
+            X = df.drop(columns=['y']).values
+            y = df['y'].values
+            feature_names = df.drop(columns=['y']).columns.tolist()
+        else:
+            # Assume last column is label
+            X = df.iloc[:, :-1].values
+            y = df.iloc[:, -1].values
+            feature_names = df.columns[:-1].tolist()
+        
+        # Convert to numeric, forcing any non-numeric to NaN
+        print("\nConverting data to numeric format...")
+        X = pd.DataFrame(X).apply(pd.to_numeric, errors='coerce').values
+        y = pd.Series(y).apply(pd.to_numeric, errors='coerce').values
+        
+        # Handle any NaN values created during conversion
+        if np.any(np.isnan(X)):
+            print(f"Warning: Found {np.sum(np.isnan(X))} NaN values after conversion, filling with 0")
+            X = np.nan_to_num(X, nan=0.0)
+        
+        if np.any(np.isnan(y)):
+            print(f"Warning: Found {np.sum(np.isnan(y))} NaN labels, this is a data quality issue!")
+            y = np.nan_to_num(y, nan=0)
+        
+        print(f"\nFinal dataset shape: {X.shape}")
+        print(f"Number of features: {X.shape[1]}")
+        print(f"Classes: {np.unique(y)}")
+        print(f"\nClass distribution:")
+        for class_id, count in pd.Series(y).value_counts().sort_index().items():
+            class_name = {0: 'Normal', 1: 'Seizure', 2: 'Neurodegeneration'}.get(int(class_id), 'Unknown')
+            print(f"  Class {int(class_id)} ({class_name}): {count} samples")
+        
+        return X, y.astype(int), feature_names
 
-def generate_dummy_eeg_dataset(n_samples=1000):
-    """
-    Generate dummy EEG-like dataset for training.
-    Replace this with your actual EEG data loading function.
-    """
-    logger.info(f"Generating dummy EEG dataset with {n_samples} samples...")
+class TabNetTrainer:
+    """TabNet trainer for 3-class EEG classification"""
     
-    # Generate synthetic classification data
-    X_raw, y = make_classification(
-        n_samples=n_samples,
-        n_features=12,  # 5 band powers + 7 statistical features
-        n_classes=2,
-        n_redundant=2,
-        n_informative=8,
-        random_state=42,
-        class_sep=0.8
-    )
-    
-    # Convert to EEG-like feature format
-    dataset = []
-    for i in range(n_samples):
-        # Split features into band powers and statistics
-        features = {
-            "band_powers": {
-                "Delta_Waves": float(abs(X_raw[i][0])),
-                "Theta_Waves": float(abs(X_raw[i][1])),
-                "Alpha_Waves": float(abs(X_raw[i][2])),
-                "Beta_Waves": float(abs(X_raw[i][3])),
-                "Gamma_Waves": float(abs(X_raw[i][4]))
-            },
-            "statistics": {
-                "mean_amplitude": float(X_raw[i][5]),
-                "signal_variance": float(abs(X_raw[i][6])),
-                "standard_deviation": float(abs(X_raw[i][7])),
-                "kurtosis": float(X_raw[i][8]),
-                "skewness": float(X_raw[i][9]),
-                "peak_amplitude": float(abs(X_raw[i][10])),
-                "rms_amplitude": float(abs(X_raw[i][11]))
-            }
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
+        self.feature_names = None
+        self.class_mapping = {
+            0: 'Normal',
+            1: 'Seizure',
+            2: 'Neurodegeneration'
         }
+    
+    def prepare_data(self, X, y):
+        """Prepare data with proper scaling and encoding"""
+        print("\nPreparing data for training...")
         
-        sample = {
-            "features": features,
-            "label": int(y[i])  # 0 = Normal, 1 = Seizure
-        }
-        dataset.append(sample)
-    
-    # Verify class distribution
-    class_counts = {}
-    for sample in dataset:
-        label = sample["label"]
-        class_counts[label] = class_counts.get(label, 0) + 1
-    
-    logger.info(f"Dataset class distribution: {class_counts}")
-    return dataset
-
-def prepare_data_for_tabnet(dataset):
-    """
-    Convert dataset into feature matrix (X) and labels (y) for TabNet training.
-    """
-    logger.info("Preparing data for TabNet training...")
-    
-    X = []
-    y = []
-    
-    for sample in dataset:
-        try:
-            feats = []
-            
-            # Flatten band powers
-            if "band_powers" in sample["features"]:
-                for val in sample["features"]["band_powers"].values():
-                    feats.append(float(val))
-            
-            # Flatten statistics
-            if "statistics" in sample["features"]:
-                for val in sample["features"]["statistics"].values():
-                    feats.append(float(val))
-            
-            if len(feats) > 0:
-                X.append(feats)
-                y.append(int(sample["label"]))
-                
-        except Exception as e:
-            logger.warning(f"Skipping invalid sample: {e}")
-            continue
-    
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.int64)
-    
-    logger.info(f"Prepared {len(X)} samples with {X.shape[1]} features")
-    logger.info(f"Feature matrix shape: {X.shape}")
-    logger.info(f"Label distribution: {np.bincount(y)}")
-    
-    return X, y
-
-def train_and_save_tabnet():
-    """
-    Train TabNet model and save to disk.
-    """
-    try:
-        logger.info("🚀 Starting TabNet model training...")
+        # Ensure X is float array
+        X = X.astype(np.float32)
         
-        # Load dataset (replace with your actual data loading)
-        dataset = generate_dummy_eeg_dataset(n_samples=2000)
+        # Encode labels
+        y_encoded = self.label_encoder.fit_transform(y)
         
-        # Prepare data
-        X, y = prepare_data_for_tabnet(dataset)
+        # Final check for invalid values
+        if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+            print("Warning: Found NaN or Inf values in final check, cleaning...")
+            X = np.nan_to_num(X, nan=0.0, posinf=1e10, neginf=-1e10)
         
-        # Check if we have enough samples and classes
-        unique_classes = np.unique(y)
-        if len(unique_classes) < 2:
-            raise ValueError(f"Need at least 2 classes for training, got {len(unique_classes)}")
+        print(f"Prepared dataset shape: {X.shape}")
+        print(f"Label encoding: {dict(zip(self.label_encoder.classes_, range(len(self.label_encoder.classes_))))}")
         
-        if len(X) < 50:
-            raise ValueError(f"Need at least 50 samples for TabNet training, got {len(X)}")
+        return X.astype(np.float32), y_encoded
+    
+    def train(self, X, y):
+        """Train TabNet model with optimal hyperparameters"""
+        print("\n" + "="*60)
+        print("Training TabNet Model for 3-Class EEG Classification")
+        print("="*60)
         
-        # Split data
+        # Split data (80% train, 20% test)
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
         
-        logger.info(f"Training set: {len(X_train)} samples")
-        logger.info(f"Test set: {len(X_test)} samples")
+        print(f"\nTrain set: {X_train.shape}")
+        print(f"Test set: {X_test.shape}")
         
-        # Train TabNet model
-        logger.info("Training TabNet classifier...")
+        # Scale features
+        print("\nScaling features...")
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
         
-        model = TabNetClassifier(
-            n_d=8,
-            n_a=8,
-            n_steps=3,
-            gamma=1.3,
-            lambda_sparse=1e-3,
-            optimizer_fn=torch.optim.Adam,  # ← Fixed: No lambda
-            optimizer_params=dict(lr=2e-2),  # ← Fixed: Pass lr separately
-            scheduler_params={"step_size": 10, "gamma": 0.9},
-            scheduler_fn=torch.optim.lr_scheduler.StepLR,
-            mask_type='sparsemax',
-            verbose=1
-            )
+        # Apply SMOTE for class balancing
+        print("\nChecking class balance...")
+        train_class_counts = pd.Series(y_train).value_counts()
+        print(f"Training set class distribution:\n{train_class_counts}")
         
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            eval_name=["test"],
-            eval_metric=["accuracy"],
-            max_epochs=100,
-            patience=20,
-            batch_size=256,
-            virtual_batch_size=128,
-            num_workers=0,
-            drop_last=False
+        # Only apply SMOTE if classes are imbalanced
+        if train_class_counts.min() < train_class_counts.max() * 0.8:
+            print("\nApplying SMOTE for class balance...")
+            try:
+                smote = SMOTE(random_state=42, k_neighbors=3)
+                X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
+                print(f"After SMOTE: {X_train_balanced.shape}")
+                print(f"Balanced class distribution:\n{pd.Series(y_train_balanced).value_counts()}")
+            except Exception as e:
+                print(f"SMOTE not applied: {e}")
+                X_train_balanced, y_train_balanced = X_train_scaled, y_train
+        else:
+            print("Classes are already balanced, skipping SMOTE")
+            X_train_balanced, y_train_balanced = X_train_scaled, y_train
+        
+        # Ensure data types are correct for TabNet
+        X_train_balanced = X_train_balanced.astype(np.float32)
+        X_test_scaled = X_test_scaled.astype(np.float32)
+        
+        # Create validation set
+        X_train_final, X_val, y_train_final, y_val = train_test_split(
+            X_train_balanced, y_train_balanced, test_size=0.15,
+            random_state=42, stratify=y_train_balanced
         )
         
-        # Evaluate model
-        y_pred = model.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        cm = confusion_matrix(y_test, y_pred)
+        print(f"\nFinal train: {X_train_final.shape}")
+        print(f"Validation: {X_val.shape}")
+        print(f"Test: {X_test_scaled.shape}")
         
-        logger.info(f"✅ TabNet training completed!")
-        logger.info(f"📊 Test Accuracy: {accuracy * 100:.2f}%")
-        logger.info(f"📊 Confusion Matrix:\n{cm}")
+        # Configure TabNet model - optimized for 179 features
+        print("\n" + "-"*60)
+        print("Configuring TabNet model...")
+        self.model = TabNetClassifier(
+            n_d=64,                    # Decision prediction layer width
+            n_a=64,                    # Attention embedding width
+            n_steps=5,                 # Number of sequential attention steps
+            gamma=1.3,                 # Coefficient for feature reusage
+            lambda_sparse=1e-3,        # Sparsity regularization
+            optimizer_fn=torch.optim.Adam,
+            optimizer_params=dict(lr=0.02),
+            mask_type='entmax',        # Attention mechanism type
+            scheduler_fn=torch.optim.lr_scheduler.StepLR,
+            scheduler_params=dict(step_size=20, gamma=0.9),
+            verbose=1,
+            device_name='auto',
+            seed=42
+        )
         
-        # Print detailed classification report
-        report = classification_report(y_test, y_pred, target_names=['Normal', 'Seizure'])
-        logger.info(f"📊 Classification Report:\n{report}")
+        print("TabNet Configuration:")
+        print(f"  - Decision layer width: 64")
+        print(f"  - Attention layer width: 64")
+        print(f"  - Sequential steps: 5")
+        print(f"  - Learning rate: 0.02")
+        print(f"  - Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
         
-        # Save model to disk
-        model_dir = "app/ml_models"
-        os.makedirs(model_dir, exist_ok=True)
-        model_path = os.path.join(model_dir, "tabnet_model")  # TabNet adds .zip automatically
+        # Train model
+        print("\n" + "-"*60)
+        print("Training TabNet...")
+        print("-"*60)
         
-        logger.info(f"💾 Saving TabNet model to {model_path}.zip...")
+        try:
+            self.model.fit(
+                X_train_final, y_train_final,
+                eval_set=[(X_val, y_val)],
+                eval_name=['validation'],
+                eval_metric=['accuracy'],
+                max_epochs=100,
+                patience=20,
+                batch_size=256,
+                virtual_batch_size=128,
+                num_workers=0,
+                drop_last=False
+            )
+        except Exception as e:
+            print(f"Training encountered an issue: {e}")
+            print("Continuing with model evaluation...")
         
-        model.save_model(model_path)
+        # Evaluate on training data
+        train_pred = self.model.predict(X_train_balanced)
+        train_acc = accuracy_score(y_train_balanced, train_pred)
         
-        # Verify save
-        zip_path = f"{model_path}.zip"
-        if os.path.exists(zip_path):
-            file_size = os.path.getsize(zip_path)
-            logger.info(f"✅ TabNet model saved successfully ({file_size} bytes)")
-        else:
-            raise Exception("Failed to save model file")
-            
-        # Test loading the saved model
-        logger.info("🔍 Testing model loading...")
-        test_model = TabNetClassifier()
-        test_model.load_model(model_path)
+        # Evaluate on test data
+        test_pred = self.model.predict(X_test_scaled)
+        test_acc = accuracy_score(y_test, test_pred)
         
-        # Quick prediction test
-        test_pred = test_model.predict(X_test[:5])
-        logger.info(f"✅ Model loading test successful. Sample predictions: {test_pred}")
+        print("\n" + "-"*60)
+        print(f"Training Accuracy: {train_acc:.4f} ({train_acc*100:.2f}%)")
+        print(f"Test Accuracy: {test_acc:.4f} ({test_acc*100:.2f}%)")
         
-        return {
-            "model_path": zip_path,
-            "accuracy": accuracy * 100,
-            "confusion_matrix": cm.tolist(),
-            "train_samples": len(X_train),
-            "test_samples": len(X_test),
-            "feature_count": X.shape[1]
+        # Detailed classification report
+        print("\n" + "="*60)
+        print("Classification Report (Test Set)")
+        print("="*60)
+        target_names = [self.class_mapping[i] for i in sorted(self.class_mapping.keys())]
+        print(classification_report(y_test, test_pred, target_names=target_names, digits=4))
+        
+        # Confusion matrix
+        print("\nConfusion Matrix:")
+        cm = confusion_matrix(y_test, test_pred)
+        print(cm)
+        print("\nConfusion Matrix Format:")
+        print("           Predicted")
+        print("           Normal  Seizure  Neurodegeneration")
+        print(f"Normal       {cm[0,0]:>4}    {cm[0,1]:>4}       {cm[0,2]:>4}")
+        print(f"Seizure      {cm[1,0]:>4}    {cm[1,1]:>4}       {cm[1,2]:>4}")
+        print(f"Neurodegenr. {cm[2,0]:>4}    {cm[2,1]:>4}       {cm[2,2]:>4}")
+        
+        # Feature importance
+        print("\n" + "-"*60)
+        print("Top 15 Most Important Features:")
+        print("-"*60)
+        feature_importances = self.model.feature_importances_
+        top_indices = np.argsort(feature_importances)[-15:][::-1]
+        for rank, idx in enumerate(top_indices, 1):
+            feature_name = self.feature_names[idx] if self.feature_names else f"Feature {idx}"
+            print(f"  {rank:>2}. {feature_name}: {feature_importances[idx]:.6f}")
+        
+        return self.model, test_acc
+    
+    def save_model(self, filepath):
+        """Save trained TabNet model"""
+        if self.model is None:
+            print("Error: No model to save")
+            return
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        # Get actual feature count
+        n_features = len(self.feature_names) if self.feature_names else 178
+        
+        # Save TabNet model (keep existing naming convention)
+        tabnet_path = filepath.replace('.pkl', '_tabnet')
+        self.model.save_model(tabnet_path)
+        
+        # Save additional components
+        model_components = {
+            'scaler': self.scaler,
+            'label_encoder': self.label_encoder,
+            'feature_names': self.feature_names,
+            'class_mapping': self.class_mapping,
+            'n_features': n_features,
+            'feature_importances': self.model.feature_importances_,
+            'model_type': 'TabNet',
+            'classes': list(self.class_mapping.values())
         }
         
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_components, f)
+        
+        print(f"\n✅ TabNet model saved successfully!")
+        print(f"   Model weights: {tabnet_path}")
+        print(f"   Model components: {filepath}")
+        print(f"   Model type: TabNet")
+        print(f"   Features: {n_features}")
+        print(f"   Classes: {list(self.class_mapping.values())}")
+
+def main():
+    """Main training function"""
+    print("\n" + "="*60)
+    print("🚀 TabNet Model Training for 3-Class EEG Classification")
+    print("   Normal | Seizure | Neurodegeneration")
+    print("="*60)
+    
+    # Initialize components
+    loader = DataLoader()
+    trainer = TabNetTrainer()
+    
+    # File path - matches your folder structure
+    data_file = "Data/Normal/3class_eeg_balanced_178features.csv"
+    
+    try:
+        # Check if file exists
+        if not os.path.exists(data_file):
+            raise FileNotFoundError(
+                f"Dataset not found at: {data_file}\n"
+                f"Please ensure '3class_eeg_balanced_178features.csv' is in Data/Normal/ folder"
+            )
+        
+        # Load data
+        X, y, feature_names = loader.load_eeg_data(data_file)
+        trainer.feature_names = feature_names
+        
+        # Prepare data
+        X_prepared, y_prepared = trainer.prepare_data(X, y)
+        
+        # Train model
+        model, accuracy = trainer.train(X_prepared, y_prepared)
+        
+        # Save model - matches your existing path structure
+        model_path = 'ml_models/trained_models/tabnet_model.pkl'
+        trainer.save_model(model_path)
+        
+        print("\n" + "="*60)
+        print("✅ TabNet Training Complete!")
+        print(f"   Final Test Accuracy: {accuracy:.2%}")
+        if accuracy >= 0.90:
+            print("   🎯 TARGET ACHIEVED: ≥90% accuracy!")
+        print(f"   Model saved at: {model_path}")
+        print("="*60)
+        
+    except FileNotFoundError as e:
+        print(f"\n❌ File Error: {e}")
     except Exception as e:
-        logger.error(f"❌ TabNet training failed: {str(e)}")
-        raise
+        print(f"\n❌ Training failed with error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    try:
-        # Import torch here to avoid issues if not installed
-        import torch
-        
-        results = train_and_save_tabnet()
-        print("\n" + "="*50)
-        print("🎉 TABNET TRAINING COMPLETED SUCCESSFULLY!")
-        print("="*50)
-        print(f"Model saved to: {results['model_path']}")
-        print(f"Accuracy: {results['accuracy']:.2f}%")
-        print(f"Training samples: {results['train_samples']}")
-        print(f"Test samples: {results['test_samples']}")
-        print(f"Feature count: {results['feature_count']}")
-        print("="*50)
-        
-    except ImportError as e:
-        print(f"\n❌ Missing dependency: {e}")
-        print("Please install: pip install torch pytorch-tabnet")
-        exit(1)
-    except Exception as e:
-        print(f"\n❌ Training failed: {e}")
-        exit(1)
+    main()

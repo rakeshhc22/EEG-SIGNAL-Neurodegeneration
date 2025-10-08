@@ -11,7 +11,7 @@ import UploadEEG from "./pages/UploadEEG";
 import SignalAnalysis from "./pages/SignalAnalysis";
 import Results from "./pages/Results";
 import Patients from "./pages/Patients";
-import Reports from "./pages/Reports";
+
 
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -47,7 +47,7 @@ function App() {
                     <Route path="/analysis" element={<SignalAnalysis />} />
                     <Route path="/results" element={<Results />} />
                     <Route path="/patients" element={<Patients />} />
-                    <Route path="/reports" element={<Reports />} />
+                    
                     <Route path="*" element={<Navigate to="/dashboard" replace />} />
                   </Routes>
                 </>

@@ -1,0 +1,208 @@
+# backend/app/services/training_service.py
+
+"""
+Training Service for 179-Feature EEG Classification
+---------------------------------------------------
+- Direct CSV loading (no feature extraction needed)
+- QDA & TabNet model predictions
+- Simple and clean structure
+"""
+
+import os
+import pickle
+import numpy as np
+from typing import Dict
+from .feature_extraction import extract_features_for_prediction
+
+class TrainingService:
+    """Simple service for EEG prediction using pretrained models"""
+    
+    def __init__(self):
+        """Initialize with pretrained model paths"""
+        self.qda_model_path = 'ml_models/trained_models/qda_model.pkl'
+        self.tabnet_model_path = 'ml_models/trained_models/tabnet_model.pkl'
+        self.tabnet_weights_path = 'ml_models/trained_models/tabnet_model_tabnet'
+        
+        # Load models at startup
+        self.qda_package = self._load_qda()
+        self.tabnet_package = self._load_tabnet()
+    
+    def _load_qda(self):
+        """Load QDA model package once at startup"""
+        try:
+            with open(self.qda_model_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load QDA model: {e}")
+            return None
+    
+    def _load_tabnet(self):
+        """Load TabNet components once at startup"""
+        try:
+            with open(self.tabnet_model_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load TabNet components: {e}")
+            return None
+    
+    def predict(self, file_path: str) -> Dict:
+        """
+        Run prediction on uploaded CSV file.
+        
+        Args:
+            file_path: Path to uploaded CSV with 179 features
+            
+        Returns:
+            dict: Predictions from QDA, TabNet, and ensemble
+        """
+        try:
+            # Load features from CSV (179 features, no label)
+            features = extract_features_for_prediction(file_path)
+            
+            # QDA Prediction
+            qda_result = self._predict_qda(features)
+            
+            # TabNet Prediction  
+            tabnet_result = self._predict_tabnet(features)
+            
+            # Ensemble
+            ensemble_result = self._create_ensemble(qda_result, tabnet_result)
+            
+            return {
+                "QDA": qda_result,
+                "TabNet": tabnet_result,
+                "ensemble": ensemble_result
+            }
+            
+        except Exception as e:
+            return {
+                "QDA": {"predicted_class": "Error", "confidence": 0, "error": str(e)},
+                "TabNet": {"predicted_class": "Error", "confidence": 0, "error": str(e)},
+                "ensemble": {"predicted_class": "Error", "confidence": 0}
+            }
+    
+    def _predict_qda(self, features: np.ndarray) -> Dict:
+        """QDA prediction"""
+        if not self.qda_package:
+            return {"predicted_class": "Error", "confidence": 0, "error": "Model not loaded"}
+        
+        try:
+            model = self.qda_package['model']
+            scaler = self.qda_package['scaler']
+            class_mapping = self.qda_package['class_mapping']
+            
+            # Scale and predict
+            features_scaled = scaler.transform(features)
+            prediction = model.predict(features_scaled)
+            probabilities = model.predict_proba(features_scaled)
+            
+            predicted_class_id = int(prediction[0])
+            predicted_class_name = class_mapping[predicted_class_id]
+            confidence = float(probabilities[0][predicted_class_id]) * 100
+            
+            prob_dict = {
+                class_mapping[i]: float(probabilities[0][i]) * 100
+                for i in range(len(class_mapping))
+            }
+            
+            return {
+                "predicted_class": predicted_class_name,
+                "confidence": confidence,
+                "accuracy": confidence,
+                "probabilities": list(probabilities[0]),
+                "probability_details": prob_dict,
+                "model": "QDA",
+                "method": "Quadratic Discriminant Analysis"
+            }
+            
+        except Exception as e:
+            return {"predicted_class": "Error", "confidence": 0, "error": str(e)}
+    
+    def _predict_tabnet(self, features: np.ndarray) -> Dict:
+        """TabNet prediction"""
+        if not self.tabnet_package:
+            return {"predicted_class": "Error", "confidence": 0, "error": "Model not loaded"}
+        
+        try:
+            from pytorch_tabnet.tab_model import TabNetClassifier
+            
+            scaler = self.tabnet_package['scaler']
+            class_mapping = self.tabnet_package['class_mapping']
+            
+            # Load TabNet model
+            model = TabNetClassifier()
+            
+            # Try loading from .zip file directly (TabNet handles it)
+            zip_path = self.tabnet_weights_path + '.zip'
+            if os.path.exists(zip_path):
+                model.load_model(self.tabnet_weights_path)  # Without .zip extension
+            elif os.path.exists(self.tabnet_weights_path):
+                model.load_model(self.tabnet_weights_path)
+            else:
+                raise FileNotFoundError("TabNet weights not found")
+            
+            # Scale and predict
+            features_scaled = scaler.transform(features).astype(np.float32)
+            prediction = model.predict(features_scaled)
+            probabilities = model.predict_proba(features_scaled)
+            
+            predicted_class_id = int(prediction[0])
+            predicted_class_name = class_mapping[predicted_class_id]
+            confidence = float(probabilities[0][predicted_class_id]) * 100
+            
+            prob_dict = {
+                class_mapping[i]: float(probabilities[0][i]) * 100
+                for i in range(len(class_mapping))
+            }
+            
+            return {
+                "predicted_class": predicted_class_name,
+                "confidence": confidence,
+                "accuracy": confidence,
+                "probabilities": list(probabilities[0]),
+                "probability_details": prob_dict,
+                "model": "TabNet",
+                "method": "Attention-based Neural Network"
+            }
+            
+        except Exception as e:
+            return {"predicted_class": "Error", "confidence": 0, "error": str(e)}
+    
+    def _create_ensemble(self, qda: Dict, tabnet: Dict) -> Dict:
+        """Combine QDA and TabNet predictions"""
+        qda_valid = qda.get("predicted_class") not in ["Error", None]
+        tabnet_valid = tabnet.get("predicted_class") not in ["Error", None]
+        
+        if qda_valid and tabnet_valid:
+            # Both models succeeded - weighted average
+            qda_conf = qda["confidence"]
+            tabnet_conf = tabnet["confidence"]
+            avg_conf = (qda_conf * 0.4 + tabnet_conf * 0.6)
+            pred_class = tabnet["predicted_class"] if tabnet_conf >= qda_conf else qda["predicted_class"]
+            
+            return {
+                "predicted_class": pred_class,
+                "confidence": round(avg_conf, 1),
+                "method": "Ensemble (QDA + TabNet)"
+            }
+        elif qda_valid:
+            return {
+                "predicted_class": qda["predicted_class"],
+                "confidence": qda["confidence"],
+                "method": "QDA Only"
+            }
+        elif tabnet_valid:
+            return {
+                "predicted_class": tabnet["predicted_class"],
+                "confidence": tabnet["confidence"],
+                "method": "TabNet Only"
+            }
+        else:
+            return {
+                "predicted_class": "Analysis Failed",
+                "confidence": 0.0,
+                "method": "No Valid Predictions"
+            }
+
+# Global instance
+training_service = TrainingService()
